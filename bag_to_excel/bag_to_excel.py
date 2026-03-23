@@ -126,10 +126,13 @@ class BagRecorder(Node):
 
             # Header
             writer.writerow(
-                ["timestamp"] + [f"Poses[{i}]" for i in range(max_poses)]
+                ["timestamp"]
+                + [f"Poses[{i}]" for i in range(max_poses)]
+                + ["Diff timestamp"]
             )
 
             # One group of 3 rows per message
+            prev_t = None
             for t_sec, msg in self._mpc_data:
                 rows = [[] for _ in range(3)]  # P, V, A sub-rows
 
@@ -145,9 +148,16 @@ class BagRecorder(Node):
                     while len(r) < max_poses:
                         r.append("")
 
-                writer.writerow([round(t_sec, 9)] + rows[0])  # P — timestamp here
-                writer.writerow([""]              + rows[1])  # V
-                writer.writerow([""]              + rows[2])  # A
+                # Compute timestamp difference from previous trajectory
+                if prev_t is None:
+                    dt = 0.0
+                else:
+                    dt = (t_sec - prev_t) * 1000.0
+                prev_t = t_sec
+
+                writer.writerow([round(t_sec, 9)] + rows[0] + [round(dt, 9)])  # P
+                writer.writerow([""]              + rows[1] + [""])             # V
+                writer.writerow([""]              + rows[2] + [""])             # A
 
     def _write_odom_csv(self, path: str):
         """
