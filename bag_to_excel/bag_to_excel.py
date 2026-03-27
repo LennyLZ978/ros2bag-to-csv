@@ -22,18 +22,20 @@ With --namespace robot1:  /robot1/mpc_traj   /robot1/odom
 
 Output layout
 -------------
-mpc_traj.csv  (screenshot 1 — timestamps as row groups, poses as columns):
-    timestamp , Poses[0] , Poses[1] , ...
-    t1        , pos.x[0] , pos.x[1] , ...   <- P row
-              , pos.y[0] , pos.y[1] , ...   <- V row
-              , yaw[0]   , yaw[1]   , ...   <- A row
-    t2        , ...
+mpc_traj.csv  (timestamps as row groups, poses as columns, alternate messages only):
+    timestamp , Poses[0] , Poses[1] , ...  , Diff timestamp
+    t1        , pos.x[0] , pos.x[1] , ...  , dt    <- x row
+              , pos.y[0] , pos.y[1] , ...  ,       <- y row
+              , pos.z[0] , pos.z[1] , ...  ,       <- z row
+    t3        , ...
+    (only alternate timestamps: t1, t3, t5, …)
 
-odom.csv  (screenshot 2 — transposed, timestamps as columns):
-    timestamp , t1       , t2       , ...
-    P         , pos.x    , pos.x    , ...   (pose.pose.position.x)
-    V         , lin_x    , lin_x    , ...   (twist.twist.linear.x)
-    A         , ang_z    , ang_z    , ...   (twist.twist.angular.z)
+odom.csv  (vertical, alternate timestamps only):
+    timestamp , Poses
+    t1        , pos.x    <- x row
+              , pos.y    <- y row
+              , pos.z    <- z row
+    t3        , ...
 """
 
 import argparse
@@ -41,6 +43,9 @@ import csv
 import math
 import os
 import sys
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 import rclpy
 from rclpy.node import Node
@@ -102,24 +107,34 @@ class BagRecorder(Node):
         self._write_mpc_traj_csv(traj_path)
         self._write_odom_csv(odom_path)
 
+        # Apply diagonal highlighting and save as .xlsx
+        traj_xlsx = self._highlight_diagonal_xlsx(traj_path)
+        odom_xlsx = self._highlight_diagonal_xlsx(odom_path)
+
         self.get_logger().info(
             f"\nSaved:\n  {traj_path}  ({len(self._mpc_data)} messages)\n"
-            f"  {odom_path}  ({len(self._odom_data)} messages)"
+            f"  {odom_path}  ({len(self._odom_data)} messages)\n"
+            f"  {traj_xlsx}  (with diagonal highlighting)\n"
+            f"  {odom_xlsx}  (with diagonal highlighting)"
         )
 
     def _write_mpc_traj_csv(self, path: str):
         """
-        timestamp , Poses[0] , Poses[1] , ...
-        t1        , pos.x[0] , pos.x[1] , ...   <- P row
-                  , pos.y[0] , pos.y[1] , ...   <- V row
-                  , yaw[0]   , yaw[1]   , ...   <- A row
-        t2        , ...
+        timestamp , Poses[0] , Poses[1] , ...  , Diff timestamp
+        t1        , pos.x[0] , pos.x[1] , ...  , dt             <- x row
+                  , pos.y[0] , pos.y[1] , ...  ,                <- y row
+                  , pos.z[0] , pos.z[1] , ...  ,                <- z row
+        t3        , ...
+        (only alternate messages are recorded: t1, t3, t5, …)
         """
         if not self._mpc_data:
             print("[mpc_traj] No messages received — CSV not written.")
             return
 
-        max_poses = max(len(msg.poses) for _, msg in self._mpc_data)
+        # Keep only alternate messages (index 0, 2, 4, …)
+        alt_data = self._mpc_data[::2]
+
+        max_poses = max(len(msg.poses) for _, msg in alt_data)
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -133,15 +148,14 @@ class BagRecorder(Node):
 
             # One group of 3 rows per message
             prev_t = None
-            for t_sec, msg in self._mpc_data:
-                rows = [[] for _ in range(3)]  # P, V, A sub-rows
+            for t_sec, msg in alt_data:
+                rows = [[] for _ in range(3)]  # x, y, z sub-rows
 
                 for ps in msg.poses:
                     p = ps.pose.position
-                    o = ps.pose.orientation
                     rows[0].append(round(p.x, 9))
                     rows[1].append(round(p.y, 9))
-                    rows[2].append(round(yaw_from_quaternion(o.x, o.y, o.z, o.w), 9))
+                    rows[2].append(round(p.z, 9))
 
                 # Pad shorter pose lists with empty strings
                 for r in rows:
@@ -155,34 +169,80 @@ class BagRecorder(Node):
                     dt = (t_sec - prev_t) * 1000.0
                 prev_t = t_sec
 
-                writer.writerow([round(t_sec, 9)] + rows[0] + [round(dt, 9)])  # P
-                writer.writerow([""]              + rows[1] + [""])             # V
-                writer.writerow([""]              + rows[2] + [""])             # A
+                writer.writerow([round(t_sec, 9)] + rows[0] + [round(dt, 9)])  # x
+                writer.writerow([""]              + rows[1] + [""])             # y
+                writer.writerow([""]              + rows[2] + [""])             # z
 
     def _write_odom_csv(self, path: str):
         """
-        timestamp , t1    , t2    , ...
-        P         , pos.x , pos.x , ...
-        V         , lin_x , lin_x , ...
-        A         , ang_z , ang_z , ...
+        timestamp , Poses
+        t1        , pos.x   <- x row
+                  , pos.y   <- y row
+                  , pos.z   <- z row
+        t3        , ...
+        (alternate timestamps only)
         """
         if not self._odom_data:
             print("[odom] No messages received — CSV not written.")
             return
 
-        timestamps = [round(t, 9) for t, _ in self._odom_data]
-
-        row_defs = [
-            ("P", lambda m: round(m.pose.pose.position.x,    9)),
-            ("V", lambda m: round(m.twist.twist.linear.x,    9)),
-            ("A", lambda m: round(m.twist.twist.angular.z,   9)),
-        ]
+        # Keep only alternate messages (index 0, 2, 4, …)
+        alt_data = self._odom_data[::2]
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp"] + timestamps)
-            for label, extractor in row_defs:
-                writer.writerow([label] + [extractor(msg) for _, msg in self._odom_data])
+            writer.writerow(["timestamp", "Poses"])
+
+            for t_sec, msg in alt_data:
+                p = msg.pose.pose.position
+                writer.writerow([round(t_sec, 9), round(p.x, 9)])  # x
+                writer.writerow(["",              round(p.y, 9)])   # y
+                writer.writerow(["",              round(p.z, 9)])   # z
+
+    @staticmethod
+    def _highlight_diagonal_xlsx(csv_path: str, rows_per_group: int = 3):
+        """Read a CSV, apply diagonal highlighting with 5 alternating colours,
+        and save alongside as .xlsx."""
+        xlsx_path = csv_path.rsplit(".", 1)[0] + ".xlsx"
+
+        # Load CSV into a workbook via openpyxl (re-read so we don't duplicate
+        # the writing logic — keeps the change minimal).
+        import csv as _csv
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        with open(csv_path, newline="") as f:
+            for row in _csv.reader(f):
+                ws.append(row)
+
+        colours = [
+            PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid"),  # light blue
+            PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid"),  # light green
+            PatternFill(start_color="FFFACD", end_color="FFFACD", fill_type="solid"),  # lemon chiffon
+            PatternFill(start_color="FFD699", end_color="FFD699", fill_type="solid"),  # light orange
+            PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid"),  # light pink
+        ]
+
+        # Number of data columns (Poses columns only, exclude timestamp & diff)
+        num_pose_cols = ws.max_column - 2  # first col = timestamp, last = diff
+        if num_pose_cols <= 0:
+            wb.save(xlsx_path)
+            return xlsx_path
+
+        # Row 1 is header; data groups start at row 2
+        num_groups = (ws.max_row - 1) // rows_per_group
+
+        num_colours = len(colours)
+        for g in range(num_groups):
+            for c in range(num_pose_cols):
+                col_idx = c + 2  # +2 because col 1 = timestamp
+                fill = colours[(g + c) % num_colours]
+                for r_offset in range(rows_per_group):
+                    row_num = 2 + g * rows_per_group + r_offset
+                    ws.cell(row=row_num, column=col_idx).fill = fill
+
+        wb.save(xlsx_path)
+        return xlsx_path
 
     # ── util ───────────────────────────────────────────────────────────────────
 
